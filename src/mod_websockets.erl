@@ -197,13 +197,15 @@ maybe_start_fsm([#xmlstreamstart{ name = <<"stream", _/binary>>, attrs = Attrs}
                 #ws_state{fsm_pid = undefined, opts = Opts}=State) ->
     case lists:keyfind(<<"xmlns">>, 1, Attrs) of
         {<<"xmlns">>, ?NS_COMPONENT} ->
-            ServiceOpts = proplists:get_value(ejabberd_service, Opts, []),
+            ServiceOpts = proplists:get_value(service, Opts, []),
             do_start_fsm(ejabberd_service, ServiceOpts, State);
         _ ->
             {stop, State}
     end;
 maybe_start_fsm([#xmlel{ name = <<"open">> }],
-                #ws_state{fsm_pid = undefined, opts = Opts}=State) ->
+                #ws_state{fsm_pid = undefined} = State) ->
+    %% TODO pass max_stanza_size from Opts
+    Opts = #{access => all, shaper => none, xml_socket => true, hibernate_after => 0},
     do_start_fsm(ejabberd_c2s, Opts, State);
 maybe_start_fsm(_Els, State) ->
     {ok, State}.
@@ -212,8 +214,7 @@ do_start_fsm(FSMModule, Opts, State = #ws_state{peer = Peer, peercert = PeerCert
     SocketData = #websocket{pid = self(),
                             peername = Peer,
                             peercert = PeerCert},
-    Opts1 = [{xml_socket, true} | Opts],
-    case call_fsm_start(FSMModule, SocketData, Opts1) of
+    case call_fsm_start(FSMModule, SocketData, Opts) of
         {ok, Pid} ->
             ?LOG_DEBUG(#{what => ws_c2s_started,
                          text => <<"WebSockets starts c2s process">>,

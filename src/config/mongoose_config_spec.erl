@@ -263,6 +263,8 @@ listen() ->
 %% path: listen.*[]
 listener(Type) ->
     ExtraItems = listener_items(Type),
+    ExtraDefaults = listener_defaults(Type),
+    ExtraRequired = listener_required(Type),
     #section{
        items = ExtraItems#{<<"port">> => #option{type = integer,
                                                  validate = port},
@@ -274,10 +276,38 @@ listener(Type) ->
                                                        validate = {enum, [4, 6]}}
                           },
        format_items = map,
-       required = [<<"port">>],
-       defaults = #{<<"proto">> => tcp},
+       required = [<<"port">>] ++ ExtraRequired,
+       defaults = ExtraDefaults#{<<"proto">> => tcp},
        process = fun ?MODULE:process_listener/2
       }.
+
+listener_defaults(<<"http">>) ->
+    #{};
+listener_defaults(Type) ->
+    ExtraDefaults = xmpp_listener_defaults(Type),
+    ExtraDefaults#{<<"hibernate_after">> => 0,
+                   <<"max_stanza_size">> => infinity,
+                   <<"backlog">> => 100,
+                   <<"num_acceptors">> => 100,
+                   <<"proxy_protocol">> => false}.
+
+listener_required(<<"service">>) ->
+    [<<"password">>];
+listener_required(_) ->
+    [].
+
+xmpp_listener_defaults(<<"c2s">>) ->
+    #{<<"access">> => all,
+      <<"shaper">> => none,
+      <<"xml_socket">> => false};
+xmpp_listener_defaults(<<"s2s">>) ->
+    #{<<"shaper">> => none};
+xmpp_listener_defaults(<<"service">>) ->
+    #{<<"access">> => all,
+      <<"shaper_rule">> => none,
+      <<"check_from">> => true,
+      <<"hidden_components">> => false,
+      <<"conflict_behaviour">> => disconnect}.
 
 listener_items(<<"http">>) ->
     #{<<"tls">> => http_listener_tls(),
@@ -295,8 +325,7 @@ listener_items(Type) ->
                                          validate = non_negative},
                 <<"proxy_protocol">> => #option{type = boolean},
                 <<"num_acceptors">> => #option{type = integer,
-                                               validate = positive,
-                                               wrap = {kv, acceptors_num}}
+                                               validate = positive}
                }.
 
 xmpp_listener_items(<<"c2s">>) ->
@@ -321,8 +350,7 @@ xmpp_listener_items(<<"service">>) ->
                               validate = non_empty},
       <<"shaper_rule">> => #option{type = atom,
                                    validate = non_empty},
-      <<"check_from">> => #option{type = boolean,
-                                  wrap = {kv, service_check_from}},
+      <<"check_from">> => #option{type = boolean},
       <<"hidden_components">> => #option{type = boolean},
       <<"conflict_behaviour">> => #option{type = atom,
                                           validate = {enum, [kick_old, disconnect]}},
@@ -389,7 +417,6 @@ http_listener_tls() ->
        items = Items#{<<"verify_mode">> => #option{type = atom,
                                                    validate = {enum, [peer, selfsigned_peer, none]}}
                      },
-       wrap = {kv, ssl},
        process = fun ?MODULE:process_tls_sni/1
       }.
 
@@ -401,14 +428,17 @@ http_transport() ->
                  <<"max_connections">> => #option{type = int_or_infinity,
                                                   validate = non_negative}
                 },
-       wrap = {kv, transport_options}
+       format_items = map,
+       defaults = #{<<"num_acceptors">> => 100},
+       include = always
       }.
 
 %% path: listen.http[].protocol
 http_protocol() ->
     #section{
        items = #{<<"compress">> => #option{type = boolean}},
-       wrap = {kv, protocol_options}
+       format_items = map,
+       include = always
       }.
 
 %% path: listen.http[].handlers
@@ -424,7 +454,7 @@ http_handlers() ->
        items = maps:from_list([{Key, #list{items = http_handler(Key),
                                            wrap = none}} || Key <- Keys]),
        validate_keys = module,
-       wrap = {kv, modules}
+       include = always
       }.
 
 %% path: listen.http[].handlers.*[]
@@ -451,7 +481,10 @@ http_handler_items(<<"mod_websockets">>) ->
       <<"max_stanza_size">> => #option{type = int_or_infinity,
                                        validate = positive},
       <<"service">> => #section{items = xmpp_listener_items(<<"service">>),
-                                wrap = {kv, ejabberd_service}}};
+                                defaults = xmpp_listener_defaults(<<"service">>),
+                                format_items = map,
+                                include = always}
+     };
 http_handler_items(<<"lasse_handler">>) ->
     #{<<"module">> => #option{type = atom,
                               validate = module}};

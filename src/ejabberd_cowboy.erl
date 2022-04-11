@@ -16,12 +16,13 @@
 %%% @end
 %%%===================================================================
 -module(ejabberd_cowboy).
--behavior(gen_server).
--behavior(cowboy_middleware).
+-behaviour(gen_server).
+-behaviour(cowboy_middleware).
+-behaviour(mongoose_listener).
 
-%% ejabberd_listener API
+%% mongoose_listener API
 -export([socket_type/0,
-         start_listener/2]).
+         start_listener/1]).
 
 %% cowboy_middleware API
 -export([execute/2]).
@@ -43,7 +44,7 @@
               start_link/1, start_listener/2, start_listener/1, stop_cowboy/1]).
 
 -include("mongoose.hrl").
--type options()  :: [any()].
+-type options() :: [any()].
 -type path() :: binary().
 -type paths() :: [path()].
 -type route() :: {path() | paths(), module(), options()}.
@@ -56,33 +57,33 @@
 
 -callback cowboy_router_paths(path(), options()) -> implemented_result().
 
--record(cowboy_state, {ref, opts = []}).
+-record(cowboy_state, {ref :: atom(), opts :: mongoose_listener:options()}).
 
 %%--------------------------------------------------------------------
-%% ejabberd_listener API
+%% mongoose_listener API
 %%--------------------------------------------------------------------
 
+-spec socket_type() -> mongoose_listener:socket_type().
 socket_type() ->
     independent.
 
-start_listener({Port, IP, tcp}=Listener, Opts) ->
-    Ref = ref(Listener),
-    ChildSpec = {Listener, {?MODULE, start_link,
-                            [#cowboy_state{ref = Ref, opts = Opts}]},
-                 transient, infinity, worker, [?MODULE]},
-    {ok, Pid} = supervisor:start_child(ejabberd_listeners, ChildSpec),
-    TransportOpts = proplists:get_value(transport_options, Opts, []),
-    TransportOptsMap = maps:from_list(TransportOpts),
-    TransportOptsMap2 = TransportOptsMap#{socket_opts => [{port, Port}, {ip, IP}]},
-    TransportOptsMap3 = maybe_insert_max_connections(TransportOptsMap2, Opts),
-    Opts2 = lists:keystore(transport_options, 1, Opts, {transport_options, TransportOptsMap3}),
-    {ok, _} = start_cowboy(Ref, Opts2),
-    {ok, Pid}.
+-spec start_listener(mongoose_listener:options()) -> ok.
+start_listener(Opts = #{proto := tcp}) ->
+    ListenerId = mongoose_listener_config:listener_id(Opts),
+    Ref = ref(ListenerId),
+    ChildSpec = #{id => ListenerId,
+                  start => {?MODULE, start_link, [#cowboy_state{ref = Ref, opts = Opts}]},
+                  restart => transient,
+                  shutdown => infinity,
+                  modules => [?MODULE]},
+    mongoose_listener_sup:start_child(ChildSpec),
+    {ok, _} = start_cowboy(Ref, Opts),
+    ok.
 
 reload_dispatch(Ref) ->
     gen_server:call(Ref, reload_dispatch).
 
-%% @doc gen_server for handling shutdown when started via ejabberd_listener
+%% @doc gen_server for handling shutdown when started via mongoose_listener
 -spec start_link(_) -> 'ignore' | {'error', _} | {'ok', pid()}.
 start_link(State) ->
     gen_server:start_link(?MODULE, State, []).
@@ -131,9 +132,11 @@ execute(Req, Env) ->
 %% Internal Functions
 %%--------------------------------------------------------------------
 
+-define(RETRIES, 50).
+-define(SLEEP_TIME, 50).
+
 start_cowboy(Ref, Opts) ->
-    {Retries, SleepTime} = proplists:get_value(retries, Opts, {20, 50}),
-    do_start_cowboy(Ref, Opts, Retries, SleepTime).
+    do_start_cowboy(Ref, Opts, ?RETRIES, ?SLEEP_TIME).
 
 
 do_start_cowboy(Ref, Opts, 0, _) ->
@@ -148,16 +151,13 @@ do_start_cowboy(Ref, Opts, Retries, SleepTime) ->
     end.
 
 do_start_cowboy(Ref, Opts) ->
-    SSLOpts = proplists:get_value(ssl, Opts),
-    NumAcceptors = proplists:get_value(num_acceptors, Opts, 100),
-    TransportOpts0 = proplists:get_value(transport_options, Opts, #{}),
-    TransportOpts = TransportOpts0#{num_acceptors => NumAcceptors},
-    Modules = proplists:get_value(modules, Opts),
+    #{ip_tuple := IPTuple, port := Port, handlers := Modules,
+      transport := TransportOpts0, protocol := ProtocolOpts0} = Opts,
     Dispatch = cowboy_router:compile(get_routes(Modules)),
-    ProtocolOpts = [{env, [{dispatch, Dispatch}]} |
-                    proplists:get_value(protocol_options, Opts, [])],
+    ProtocolOpts = ProtocolOpts0#{env => [{dispatch, Dispatch}]},
+    TransportOpts = TransportOpts0#{socket_opts => [{port, Port}, {ip, IPTuple}]},
     ok = trails_store(Modules),
-    case catch start_http_or_https(SSLOpts, Ref, TransportOpts, ProtocolOpts) of
+    case catch start_http_or_https(Opts, Ref, TransportOpts, ProtocolOpts) of
         {error, {{shutdown,
                   {failed_to_start_child, ranch_acceptors_sup,
                    {{badmatch, {error, eaddrinuse}}, _ }}}, _}} ->
@@ -166,20 +166,20 @@ do_start_cowboy(Ref, Opts) ->
             Result
     end.
 
-start_http_or_https(undefined, Ref, TransportOpts, ProtocolOpts) ->
-    cowboy_start_http(Ref, TransportOpts, ProtocolOpts);
-start_http_or_https(SSLOpts, Ref, TransportOpts, ProtocolOpts) ->
+start_http_or_https(#{tls := SSLOpts}, Ref, TransportOpts, ProtocolOpts) ->
     SSLOptsWithVerifyFun = maybe_set_verify_fun(SSLOpts),
     FilteredSSLOptions = filter_options(ignored_ssl_options(), SSLOptsWithVerifyFun),
     SocketOptsWithSSL = maps:get(socket_opts, TransportOpts) ++ FilteredSSLOptions,
-    cowboy_start_https(Ref, TransportOpts#{socket_opts => SocketOptsWithSSL}, ProtocolOpts).
+    cowboy_start_https(Ref, TransportOpts#{socket_opts := SocketOptsWithSSL}, ProtocolOpts);
+start_http_or_https(#{}, Ref, TransportOpts, ProtocolOpts) ->
+    cowboy_start_http(Ref, TransportOpts, ProtocolOpts).
 
 cowboy_start_http(Ref, TransportOpts, ProtocolOpts) ->
-    ProtoOpts = add_common_middleware(make_env_map(maps:from_list(ProtocolOpts))),
+    ProtoOpts = add_common_middleware(make_env_map(ProtocolOpts)),
     cowboy:start_clear(Ref, TransportOpts, ProtoOpts).
 
 cowboy_start_https(Ref, TransportOpts, ProtocolOpts) ->
-    ProtoOpts = add_common_middleware(make_env_map(maps:from_list(ProtocolOpts))),
+    ProtoOpts = add_common_middleware(make_env_map(ProtocolOpts)),
     cowboy:start_tls(Ref, TransportOpts, ProtoOpts).
 
 make_env_map(Map = #{ env := Env }) ->
@@ -193,8 +193,8 @@ add_common_middleware(Map = #{ middlewares := Middlewares }) ->
 add_common_middleware(Map) ->
     Map#{ middlewares => [cowboy_router, ?MODULE, cowboy_handler] }.
 
-reload_dispatch(Ref, Opts) ->
-    Dispatch = cowboy_router:compile(get_routes(proplists:get_value(modules, Opts))),
+reload_dispatch(Ref, #{modules := Modules}) ->
+    Dispatch = cowboy_router:compile(get_routes(Modules)),
     cowboy:set_env(Ref, dispatch, Dispatch).
 
 stop_cowboy(Ref) ->
@@ -273,17 +273,6 @@ maybe_set_verify_fun(SSLOptions) ->
         Mode ->
             Fun = just_tls:verify_fun(Mode),
             lists:keystore(verify_fun, 1, SSLOptions, {verify_fun, Fun})
-    end.
-
-% This functions is for backward compatibility, as previous default config
-% used max_connections tuple for all ejabberd_cowboy listeners
-maybe_insert_max_connections(TransportOpts, Opts) ->
-    Key = max_connections,
-    case proplists:get_value(Key, Opts) of
-        undefined ->
-            TransportOpts;
-        Value ->
-            TransportOpts#{Key => Value}
     end.
 
 %% -------------------------------------------------------------------

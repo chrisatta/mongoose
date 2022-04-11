@@ -31,6 +31,7 @@
 %% API
 -export([start_link/4,
          start/4,
+         listener_to_receiver_opts/1,
          change_shaper/2,
          starttls/2,
          get_socket/1,
@@ -58,6 +59,9 @@
                 hibernate_after = 0 :: non_neg_integer()}).
 -type state() :: #state{}.
 
+-type options() :: #{max_stanza_size := non_neg_integer() | infinity,
+                     hibernate_after := non_neg_integer()}.
+
 %%====================================================================
 %% API
 %%====================================================================
@@ -65,20 +69,20 @@
 %% Function: start_link() -> {ok, Pid} | ignore | {error, Error}
 %% Description: Starts the server
 %%--------------------------------------------------------------------
--spec start_link(_, _, _, _) -> 'ignore' | {'error', _} | {'ok', pid()}.
-start_link(Socket, SockMod, Shaper, ConnOpts) ->
-    gen_server:start_link(
-      ?MODULE, [Socket, SockMod, Shaper, ConnOpts], []).
+-spec start_link(port(), ejabberd:sockmod(), atom(), options()) ->
+          ignore | {error, _} | {ok, pid()}.
+start_link(Socket, SockMod, Shaper, Opts) ->
+    gen_server:start_link(?MODULE, [Socket, SockMod, Shaper, Opts], []).
 
-%%--------------------------------------------------------------------
-%% Function: start() -> {ok, Pid} | ignore | {error, Error}
-%% Description: Starts the server
-%%--------------------------------------------------------------------
-start(Socket, SockMod, Shaper, ConnOpts) ->
-    {ok, Pid} = supervisor:start_child(
-                  ejabberd_receiver_sup,
-                  [Socket, SockMod, Shaper, ConnOpts]),
+-spec start(port(), ejabberd:sockmod(), atom(), options()) -> pid().
+start(Socket, SockMod, Shaper, Opts) ->
+    {ok, Pid} = supervisor:start_child(ejabberd_receiver_sup,
+                                       [Socket, SockMod, Shaper, Opts]),
     Pid.
+
+-spec listener_to_receiver_opts(mongoose_listener:options()) -> options().
+listener_to_receiver_opts(Opts) ->
+    maps:with([max_stanza_size, hibernate_after], Opts).
 
 -spec change_shaper(atom() | pid() | {atom(), _} | {'via', _, _}, _) -> 'ok'.
 change_shaper(Pid, Shaper) ->
@@ -112,24 +116,13 @@ close(Pid) ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 -spec init([any(), ...]) -> {'ok', state()}.
-init([Socket, SockMod, Shaper, ConnOpts]) ->
+init([Socket, SockMod, Shaper, Opts]) ->
     ShaperState = shaper:new(Shaper),
+    #{max_stanza_size := MaxStanzaSize, hibernate_after := HibernateAfter} = Opts,
     Timeout = case SockMod of
-                  ssl ->
-                      20;
-                  _ ->
-                      infinity
+                  ssl -> 20;
+                  _ -> infinity
               end,
-    MaxStanzaSize =
-        case lists:keyfind(max_stanza_size, 1, ConnOpts) of
-            {_, Size} -> Size;
-            _ -> infinity
-        end,
-    HibernateAfter =
-        case lists:keyfind(hibernate_after, 1, ConnOpts) of
-            {_, HA} -> HA;
-            _ -> 0
-        end,
     {ok, #state{socket = Socket,
                 sock_mod = SockMod,
                 shaper_state = ShaperState,
